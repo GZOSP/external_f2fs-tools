@@ -259,15 +259,27 @@ static inline unsigned long __bitmap_size(struct f2fs_sb_info *sbi, int flag)
 	return 0;
 }
 
+static inline block_t __cp_payload(struct f2fs_sb_info *sbi)
+{
+	return le32_to_cpu(F2FS_RAW_SUPER(sbi)->cp_payload);
+}
+
 static inline void *__bitmap_ptr(struct f2fs_sb_info *sbi, int flag)
 {
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
 	int offset;
 
 	if (is_set_ckpt_flags(ckpt, CP_LARGE_NAT_BITMAP_FLAG)) {
+		unsigned int chksum_size = 0;
+
 		offset = (flag == SIT_BITMAP) ?
 			le32_to_cpu(ckpt->nat_ver_bitmap_bytesize) : 0;
-		return &ckpt->sit_nat_version_bitmap + offset;
+
+		if (le32_to_cpu(ckpt->checksum_offset) ==
+					CP_MIN_CHKSUM_OFFSET)
+			chksum_size = sizeof(__le32);
+
+		return &ckpt->sit_nat_version_bitmap + offset + chksum_size;
 	}
 
 	if (le32_to_cpu(F2FS_RAW_SUPER(sbi)->cp_payload) > 0) {
@@ -364,13 +376,16 @@ static inline block_t sum_blk_addr(struct f2fs_sb_info *sbi, int base, int type)
 
 static inline bool IS_VALID_NID(struct f2fs_sb_info *sbi, u32 nid)
 {
-	return (nid <= (NAT_ENTRY_PER_BLOCK *
+	return (nid < (NAT_ENTRY_PER_BLOCK *
 			le32_to_cpu(F2FS_RAW_SUPER(sbi)->segment_count_nat)
 			<< (sbi->log_blocks_per_seg - 1)));
 }
 
 static inline bool IS_VALID_BLK_ADDR(struct f2fs_sb_info *sbi, u32 addr)
 {
+	if (addr == NULL_ADDR || addr == NEW_ADDR)
+		return 1;
+
 	if (addr >= le64_to_cpu(F2FS_RAW_SUPER(sbi)->block_count) ||
 				addr < SM_I(sbi)->main_blkaddr) {
 		DBG(1, "block addr [0x%x]\n", addr);
@@ -380,15 +395,12 @@ static inline bool IS_VALID_BLK_ADDR(struct f2fs_sb_info *sbi, u32 addr)
 	return 1;
 }
 
-static inline int IS_CUR_SEGNO(struct f2fs_sb_info *sbi, u32 segno, int type)
+static inline int IS_CUR_SEGNO(struct f2fs_sb_info *sbi, u32 segno)
 {
 	int i;
 
 	for (i = 0; i < NO_CHECK_TYPE; i++) {
 		struct curseg_info *curseg = CURSEG_I(sbi, i);
-
-		if (type == i)
-			continue;
 
 		if (segno == curseg->segno)
 			return 1;

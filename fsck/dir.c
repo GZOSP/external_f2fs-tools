@@ -319,7 +319,7 @@ add_dentry:
 
 	if (dn.idirty) {
 		ASSERT(parent == dn.inode_blk);
-		ret = dev_write_block(dn.inode_blk, p_blkaddr);
+		ret = write_inode(dn.inode_blk, p_blkaddr);
 		ASSERT(ret >= 0);
 	}
 
@@ -360,7 +360,8 @@ static void make_empty_dir(struct f2fs_sb_info *sbi, struct f2fs_node *inode)
 	test_and_set_bit_le(1, dent_blk->dentry_bitmap);
 
 	set_summary(&sum, ino, 0, ni.version);
-	reserve_new_block(sbi, &blkaddr, &sum, CURSEG_HOT_DATA);
+	ret = reserve_new_block(sbi, &blkaddr, &sum, CURSEG_HOT_DATA);
+	ASSERT(!ret);
 
 	ret = dev_write_block(dent_blk, blkaddr);
 	ASSERT(ret >= 0);
@@ -395,7 +396,8 @@ static void page_symlink(struct f2fs_sb_info *sbi, struct f2fs_node *inode,
 	memcpy(data_blk, symname, symlen);
 
 	set_summary(&sum, ino, 0, ni.version);
-	reserve_new_block(sbi, &blkaddr, &sum, CURSEG_WARM_DATA);
+	ret = reserve_new_block(sbi, &blkaddr, &sum, CURSEG_WARM_DATA);
+	ASSERT(!ret);
 
 	ret = dev_write_block(data_blk, blkaddr);
 	ASSERT(ret >= 0);
@@ -445,7 +447,10 @@ static void init_inode_block(struct f2fs_sb_info *sbi,
 	node_blk->i.i_ctime_nsec = 0;
 	node_blk->i.i_mtime_nsec = 0;
 	node_blk->i.i_generation = 0;
-	node_blk->i.i_current_depth = cpu_to_le32(1);
+	if (de->file_type == F2FS_FT_DIR)
+		node_blk->i.i_current_depth = cpu_to_le32(1);
+	else
+		node_blk->i.i_current_depth = cpu_to_le32(0);
 	node_blk->i.i_xattr_nid = 0;
 	node_blk->i.i_flags = 0;
 	node_blk->i.i_inline = F2FS_INLINE_XATTR;
@@ -456,8 +461,7 @@ static void init_inode_block(struct f2fs_sb_info *sbi,
 
 	if (c.feature & cpu_to_le32(F2FS_FEATURE_EXTRA_ATTR)) {
 		node_blk->i.i_inline |= F2FS_EXTRA_ATTR;
-		node_blk->i.i_extra_isize =
-				cpu_to_le16(F2FS_TOTAL_EXTRA_ATTR_SIZE);
+		node_blk->i.i_extra_isize = cpu_to_le16(calc_extra_isize());
 	}
 
 	node_blk->footer.ino = cpu_to_le32(de->ino);
@@ -628,7 +632,8 @@ int f2fs_create(struct f2fs_sb_info *sbi, struct dentry *de)
 
 	/* write child */
 	set_summary(&sum, de->ino, 0, ni.version);
-	reserve_new_block(sbi, &blkaddr, &sum, CURSEG_HOT_NODE);
+	ret = reserve_new_block(sbi, &blkaddr, &sum, CURSEG_HOT_NODE);
+	ASSERT(!ret);
 
 	/* update nat info */
 	update_nat_blkaddr(sbi, de->ino, de->ino, blkaddr);

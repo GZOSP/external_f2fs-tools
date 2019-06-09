@@ -7,6 +7,7 @@
  * Dual licensed under the GPL or LGPL version 2 licenses.
  */
 #define _LARGEFILE64_SOURCE
+#define _FILE_OFFSET_BITS 64
 
 #include <f2fs_fs.h>
 #include <stdio.h>
@@ -472,9 +473,21 @@ f2fs_hash_t f2fs_dentry_hash(const unsigned char *name, int len)
 	return f2fs_hash;
 }
 
+#define ALIGN_DOWN(addrs, size)		(((addrs) / (size)) * (size))
 unsigned int addrs_per_inode(struct f2fs_inode *i)
 {
-	return CUR_ADDRS_PER_INODE(i) - get_inline_xattr_addrs(i);
+	unsigned int addrs = CUR_ADDRS_PER_INODE(i) - get_inline_xattr_addrs(i);
+
+	if (!(le32_to_cpu(i->i_flags) & F2FS_COMPR_FL))
+		return addrs;
+	return ALIGN_DOWN(addrs, 1 << i->i_log_cluster_size);
+}
+
+unsigned int addrs_per_block(struct f2fs_inode *i)
+{
+	if (!(le32_to_cpu(i->i_flags) & F2FS_COMPR_FL))
+		return DEF_ADDRS_PER_BLOCK;
+	return ALIGN_DOWN(DEF_ADDRS_PER_BLOCK, 1 << i->i_log_cluster_size);
 }
 
 /*
@@ -531,25 +544,46 @@ __u32 f2fs_inode_chksum(struct f2fs_node *node)
 	return chksum;
 }
 
+__u32 f2fs_checkpoint_chksum(struct f2fs_checkpoint *cp)
+{
+	unsigned int chksum_ofs = le32_to_cpu(cp->checksum_offset);
+	__u32 chksum;
+
+	chksum = f2fs_cal_crc32(F2FS_SUPER_MAGIC, cp, chksum_ofs);
+	if (chksum_ofs < CP_CHKSUM_OFFSET) {
+		chksum_ofs += sizeof(chksum);
+		chksum = f2fs_cal_crc32(chksum, (__u8 *)cp + chksum_ofs,
+						F2FS_BLKSIZE - chksum_ofs);
+	}
+	return chksum;
+}
+
+int write_inode(struct f2fs_node *inode, u64 blkaddr)
+{
+	if (c.feature & cpu_to_le32(F2FS_FEATURE_INODE_CHKSUM))
+		inode->i.i_inode_checksum =
+			cpu_to_le32(f2fs_inode_chksum(inode));
+	return dev_write_block(inode, blkaddr);
+}
+
 /*
  * try to identify the root device
  */
-const char *get_rootdev()
+char *get_rootdev()
 {
 #if defined(ANDROID_WINDOWS_HOST) || defined(WITH_ANDROID)
 	return NULL;
 #else
 	struct stat sb;
 	int fd, ret;
-	char buf[32];
+	char buf[PATH_MAX + 1];
 	char *uevent, *ptr;
-
-	static char rootdev[PATH_MAX + 1];
+	char *rootdev;
 
 	if (stat("/", &sb) == -1)
 		return NULL;
 
-	snprintf(buf, 32, "/sys/dev/block/%u:%u/uevent",
+	snprintf(buf, PATH_MAX, "/sys/dev/block/%u:%u/uevent",
 		major(sb.st_dev), minor(sb.st_dev));
 
 	fd = open(buf, O_RDONLY);
@@ -566,6 +600,8 @@ const char *get_rootdev()
 	}
 
 	uevent = malloc(ret + 1);
+	ASSERT(uevent);
+
 	uevent[ret] = '\0';
 
 	ret = read(fd, uevent, ret);
@@ -576,8 +612,16 @@ const char *get_rootdev()
 		return NULL;
 
 	ret = sscanf(ptr, "DEVNAME=%s\n", buf);
-	snprintf(rootdev, PATH_MAX + 1, "/dev/%s", buf);
+	if (strlen(buf) == 0)
+		return NULL;
 
+	ret = strlen(buf) + 5;
+	rootdev = malloc(ret + 1);
+	if (!rootdev)
+		return NULL;
+	rootdev[ret] = '\0';
+
+	snprintf(rootdev, ret + 1, "/dev/%s", buf);
 	return rootdev;
 #endif
 }
@@ -593,7 +637,6 @@ void f2fs_init_configuration(void)
 	c.ndevs = 1;
 	c.sectors_per_blk = DEFAULT_SECTORS_PER_BLOCK;
 	c.blks_per_seg = DEFAULT_BLOCKS_PER_SEGMENT;
-	c.rootdev_name = get_rootdev();
 	c.wanted_total_sectors = -1;
 	c.wanted_sector_size = -1;
 #ifndef WITH_ANDROID
@@ -615,6 +658,15 @@ void f2fs_init_configuration(void)
 	c.trim = 1;
 	c.kd = -1;
 	c.fixed_time = -1;
+
+	/* default root owner */
+	c.root_uid = getuid();
+	c.root_gid = getgid();
+}
+
+int f2fs_dev_is_writable(void)
+{
+	return !c.ro || c.force;
 }
 
 #ifdef HAVE_SETMNTENT
@@ -649,9 +701,13 @@ int f2fs_dev_is_umounted(char *path)
 	struct stat *st_buf;
 	int is_rootdev = 0;
 	int ret = 0;
+	char *rootdev_name = get_rootdev();
 
-	if (c.rootdev_name && !strcmp(path, c.rootdev_name))
-		is_rootdev = 1;
+	if (rootdev_name) {
+		if (!strcmp(path, rootdev_name))
+			is_rootdev = 1;
+		free(rootdev_name);
+	}
 
 	/*
 	 * try with /proc/mounts fist to detect RDONLY.
@@ -694,6 +750,8 @@ int f2fs_dev_is_umounted(char *path)
 	 * the file system. In this case, we should not format.
 	 */
 	st_buf = malloc(sizeof(struct stat));
+	ASSERT(st_buf);
+
 	if (stat(path, st_buf) == 0 && S_ISBLK(st_buf->st_mode)) {
 		int fd = open(path, O_RDONLY | O_EXCL);
 
@@ -739,8 +797,13 @@ void get_kernel_uname_version(__u8 *version)
 	if (uname(&buf))
 		return;
 
+#if !defined(WITH_KERNEL_VERSION)
 	snprintf((char *)version,
 		VERSION_LEN, "%s %s", buf.release, buf.version);
+#else
+	snprintf((char *)version,
+		VERSION_LEN, "%s", buf.release);
+#endif
 #else
 	memset(version, 0, VERSION_LEN);
 #endif
@@ -765,6 +828,15 @@ void get_kernel_uname_version(__u8 *version)
 #endif /* APPLE_DARWIN */
 
 #ifndef ANDROID_WINDOWS_HOST
+static int open_check_fs(char *path, int flag)
+{
+	if (c.func != FSCK || c.fix_on || c.auto_fix)
+		return -1;
+
+	/* allow to open ro */
+	return open(path, O_RDONLY | flag);
+}
+
 int get_device_info(int i)
 {
 	int32_t fd = 0;
@@ -784,20 +856,49 @@ int get_device_info(int i)
 	struct device_info *dev = c.devices + i;
 
 	if (c.sparse_mode) {
-		fd = open((char *)dev->path, O_RDWR | O_CREAT | O_BINARY, 0644);
-	} else {
-		fd = open((char *)dev->path, O_RDWR);
+		fd = open(dev->path, O_RDWR | O_CREAT | O_BINARY, 0644);
+		if (fd < 0) {
+			fd = open_check_fs(dev->path, O_BINARY);
+			if (fd < 0) {
+				MSG(0, "\tError: Failed to open a sparse file!\n");
+				return -1;
+			}
+		}
+	}
+
+	stat_buf = malloc(sizeof(struct stat));
+	ASSERT(stat_buf);
+
+	if (!c.sparse_mode) {
+		if (stat(dev->path, stat_buf) < 0 ) {
+			MSG(0, "\tError: Failed to get the device stat!\n");
+			free(stat_buf);
+			return -1;
+		}
+
+		if (S_ISBLK(stat_buf->st_mode) && !c.force) {
+			fd = open(dev->path, O_RDWR | O_EXCL);
+			if (fd < 0)
+				fd = open_check_fs(dev->path, O_EXCL);
+		} else {
+			fd = open(dev->path, O_RDWR);
+			if (fd < 0)
+				fd = open_check_fs(dev->path, 0);
+		}
 	}
 	if (fd < 0) {
 		MSG(0, "\tError: Failed to open the device!\n");
+		free(stat_buf);
 		return -1;
 	}
 
 	dev->fd = fd;
 
 	if (c.sparse_mode) {
-		if (f2fs_init_sparse_file())
+		if (f2fs_init_sparse_file()) {
+			free(stat_buf);
 			return -1;
+		}
 	}
 
 	if (c.kd == -1) {
@@ -808,13 +909,6 @@ int get_device_info(int i)
 			MSG(0, "\tInfo: No support kernel version!\n");
 			c.kd = -2;
 		}
-	}
-
-	stat_buf = malloc(sizeof(struct stat));
-	if (fstat(fd, stat_buf) < 0 ) {
-		MSG(0, "\tError: Failed to get the device stat!\n");
-		free(stat_buf);
-		return -1;
 	}
 
 	if (c.sparse_mode) {
@@ -867,13 +961,8 @@ int get_device_info(int i)
 		io_hdr.timeout = 1000;
 
 		if (!ioctl(fd, SG_IO, &io_hdr)) {
-			int i = 16;
-
-			MSG(0, "Info: [%s] Disk Model: ",
-					dev->path);
-			while (reply_buffer[i] != '`' && i < 80)
-				printf("%c", reply_buffer[i++]);
-			printf("\n");
+			MSG(0, "Info: [%s] Disk Model: %.16s\n",
+					dev->path, reply_buffer+16);
 		}
 #endif
 	} else {
@@ -892,19 +981,26 @@ int get_device_info(int i)
 	}
 
 #if !defined(WITH_ANDROID) && defined(__linux__)
-	if (S_ISBLK(stat_buf->st_mode))
-		f2fs_get_zoned_model(i);
+	if (S_ISBLK(stat_buf->st_mode)) {
+		if (f2fs_get_zoned_model(i) < 0) {
+			free(stat_buf);
+			return -1;
+		}
+	}
 
 	if (dev->zoned_model != F2FS_ZONED_NONE) {
-		if (dev->zoned_model == F2FS_ZONED_HM)
-			c.zoned_model = F2FS_ZONED_HM;
 
+		/* Get the number of blocks per zones */
 		if (f2fs_get_zone_blocks(i)) {
 			MSG(0, "\tError: Failed to get number of blocks per zone\n");
 			free(stat_buf);
 			return -1;
 		}
 
+		/*
+		 * Check zone configuration: for the first disk of a
+		 * multi-device volume, conventional zones are needed.
+		 */
 		if (f2fs_check_zones(i)) {
 			MSG(0, "\tError: Failed to check zone configuration\n");
 			free(stat_buf);
@@ -1052,22 +1148,53 @@ int f2fs_get_device_info(void)
 		return -1;
 	}
 
+	/*
+	 * Check device types and determine the final volume operation mode:
+	 *   - If all devices are regular block devices, default operation.
+	 *   - If at least one HM device is found, operate in HM mode (BLKZONED
+	 *     feature will be enabled by mkfs).
+	 *   - If an HA device is found, let mkfs decide based on the -m option
+	 *     setting by the user.
+	 */
+	c.zoned_model = F2FS_ZONED_NONE;
 	for (i = 0; i < c.ndevs; i++) {
-		if (c.devices[i].zoned_model != F2FS_ZONED_NONE) {
+		switch (c.devices[i].zoned_model) {
+		case F2FS_ZONED_NONE:
+			continue;
+		case F2FS_ZONED_HM:
+			c.zoned_model = F2FS_ZONED_HM;
+			break;
+		case F2FS_ZONED_HA:
+			if (c.zoned_model != F2FS_ZONED_HM)
+				c.zoned_model = F2FS_ZONED_HA;
+			break;
+		}
+	}
+
+	if (c.zoned_model != F2FS_ZONED_NONE) {
+
+		/*
+		 * For zoned model, the zones sizes of all zoned devices must
+		 * be equal.
+		 */
+		for (i = 0; i < c.ndevs; i++) {
+			if (c.devices[i].zoned_model == F2FS_ZONED_NONE)
+				continue;
 			if (c.zone_blocks &&
 				c.zone_blocks != c.devices[i].zone_blocks) {
-				MSG(0, "\tError: not support different zone sizes!!!\n");
+				MSG(0, "\tError: zones of different size are "
+				       "not supported\n");
 				return -1;
 			}
 			c.zone_blocks = c.devices[i].zone_blocks;
 		}
-	}
 
-	/*
-	 * Align sections to the device zone size
-	 * and align F2FS zones to the device zones.
-	 */
-	if (c.zone_blocks) {
+		/*
+		 * Align sections to the device zone size and align F2FS zones
+		 * to the device zones. For F2FS_ZONED_HA model without the
+		 * BLKZONED feature set at format time, this is only an
+		 * optimization as sequential writes will not be enforced.
+		 */
 		c.segs_per_sec = c.zone_blocks / DEFAULT_BLOCKS_PER_SEGMENT;
 		c.secs_per_zone = 1;
 	} else {
@@ -1083,4 +1210,20 @@ int f2fs_get_device_info(void)
 				c.total_sectors, (c.total_sectors *
 					(c.sector_size >> 9)) >> 11);
 	return 0;
+}
+
+unsigned int calc_extra_isize(void)
+{
+	unsigned int size = offsetof(struct f2fs_inode, i_projid);
+
+	if (c.feature & cpu_to_le32(F2FS_FEATURE_FLEXIBLE_INLINE_XATTR))
+		size = offsetof(struct f2fs_inode, i_projid);
+	if (c.feature & cpu_to_le32(F2FS_FEATURE_PRJQUOTA))
+		size = offsetof(struct f2fs_inode, i_inode_checksum);
+	if (c.feature & cpu_to_le32(F2FS_FEATURE_INODE_CHKSUM))
+		size = offsetof(struct f2fs_inode, i_crtime);
+	if (c.feature & cpu_to_le32(F2FS_FEATURE_INODE_CRTIME))
+		size = offsetof(struct f2fs_inode, i_extra_end);
+
+	return size - F2FS_EXTRA_ISIZE_OFFSET;
 }

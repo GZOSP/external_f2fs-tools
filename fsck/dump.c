@@ -31,78 +31,38 @@ const char *seg_type_name[SEG_TYPE_MAX + 1] = {
 	"SEG_TYPE_NONE",
 };
 
-void nat_dump(struct f2fs_sb_info *sbi)
+void nat_dump(struct f2fs_sb_info *sbi, nid_t start_nat, nid_t end_nat)
 {
-	struct f2fs_super_block *sb = F2FS_RAW_SUPER(sbi);
-	struct f2fs_nm_info *nm_i = NM_I(sbi);
 	struct f2fs_nat_block *nat_block;
 	struct f2fs_node *node_block;
-	u32 nr_nat_blks, nid;
-	pgoff_t block_off;
+	nid_t nid;
 	pgoff_t block_addr;
 	char buf[BUF_SZ];
-	int seg_off;
 	int fd, ret, pack;
-	unsigned int i;
 
 	nat_block = (struct f2fs_nat_block *)calloc(BLOCK_SZ, 1);
-	node_block = (struct f2fs_node *)calloc(BLOCK_SZ, 1);
 	ASSERT(nat_block);
-
-	nr_nat_blks = get_sb(segment_count_nat) <<
-				(sbi->log_blocks_per_seg - 1);
+	node_block = (struct f2fs_node *)calloc(BLOCK_SZ, 1);
+	ASSERT(node_block);
 
 	fd = open("dump_nat", O_CREAT|O_WRONLY|O_TRUNC, 0666);
 	ASSERT(fd >= 0);
 
-	for (block_off = 0; block_off < nr_nat_blks; pack = 1, block_off++) {
+	for (nid = start_nat; nid < end_nat; nid++) {
+		struct f2fs_nat_entry raw_nat;
+		struct node_info ni;
+		if(nid == 0 || nid == F2FS_NODE_INO(sbi) ||
+					nid == F2FS_META_INO(sbi))
+			continue;
 
-		seg_off = block_off >> sbi->log_blocks_per_seg;
-		block_addr = (pgoff_t)(nm_i->nat_blkaddr +
-			(seg_off << sbi->log_blocks_per_seg << 1) +
-			(block_off & ((1 << sbi->log_blocks_per_seg) - 1)));
+		ni.nid = nid;
+		block_addr = current_nat_addr(sbi, nid, &pack);
 
-		if (f2fs_test_bit(block_off, nm_i->nat_bitmap)) {
-			block_addr += sbi->blocks_per_seg;
-			pack = 2;
-		}
-
-		ret = dev_read_block(nat_block, block_addr);
-		ASSERT(ret >= 0);
-
-		nid = block_off * NAT_ENTRY_PER_BLOCK;
-		for (i = 0; i < NAT_ENTRY_PER_BLOCK; i++) {
-			struct f2fs_nat_entry raw_nat;
-			struct node_info ni;
-			ni.nid = nid + i;
-
-			if(nid + i  == 0 || nid + i  == 1 || nid + i == 2 )
-				continue;
-			if (lookup_nat_in_journal(sbi, nid + i,
-							&raw_nat) >= 0) {
-				node_info_from_raw_nat(&ni, &raw_nat);
-				ret = dev_read_block(node_block, ni.blk_addr);
-				ASSERT(ret >= 0);
-				if (ni.blk_addr != 0x0) {
-					memset(buf, 0, BUF_SZ);
-					snprintf(buf, BUF_SZ,
-						"nid:%5u\tino:%5u\toffset:%5u"
-						"\tblkaddr:%10u\tpack:%d\n",
-						ni.nid, ni.ino,
-						le32_to_cpu(node_block->footer.flag) >>
-							OFFSET_BIT_SHIFT,
-						ni.blk_addr, pack);
-					ret = write(fd, buf, strlen(buf));
-					ASSERT(ret >= 0);
-				}
-			} else {
-				node_info_from_raw_nat(&ni,
-						&nat_block->entries[i]);
-				if (ni.blk_addr == 0)
-					continue;
-
-				ret = dev_read_block(node_block, ni.blk_addr);
-				ASSERT(ret >= 0);
+		if (lookup_nat_in_journal(sbi, nid, &raw_nat) >= 0) {
+			node_info_from_raw_nat(&ni, &raw_nat);
+			ret = dev_read_block(node_block, ni.blk_addr);
+			ASSERT(ret >= 0);
+			if (ni.blk_addr != 0x0) {
 				memset(buf, 0, BUF_SZ);
 				snprintf(buf, BUF_SZ,
 					"nid:%5u\tino:%5u\toffset:%5u"
@@ -114,6 +74,26 @@ void nat_dump(struct f2fs_sb_info *sbi)
 				ret = write(fd, buf, strlen(buf));
 				ASSERT(ret >= 0);
 			}
+		} else {
+			ret = dev_read_block(nat_block, block_addr);
+			ASSERT(ret >= 0);
+			node_info_from_raw_nat(&ni,
+					&nat_block->entries[nid % NAT_ENTRY_PER_BLOCK]);
+			if (ni.blk_addr == 0)
+				continue;
+
+			ret = dev_read_block(node_block, ni.blk_addr);
+			ASSERT(ret >= 0);
+			memset(buf, 0, BUF_SZ);
+			snprintf(buf, BUF_SZ,
+				"nid:%5u\tino:%5u\toffset:%5u"
+				"\tblkaddr:%10u\tpack:%d\n",
+				ni.nid, ni.ino,
+				le32_to_cpu(node_block->footer.flag) >>
+					OFFSET_BIT_SHIFT,
+				ni.blk_addr, pack);
+			ret = write(fd, buf, strlen(buf));
+			ASSERT(ret >= 0);
 		}
 	}
 
@@ -273,15 +253,22 @@ static void dump_node_blk(struct f2fs_sb_info *sbi, int ntype,
 	struct node_info ni;
 	struct f2fs_node *node_blk;
 	u32 skip = 0;
-	u32 i, idx;
+	u32 i, idx = 0;
+
+	get_node_info(sbi, nid, &ni);
+
+	node_blk = calloc(BLOCK_SZ, 1);
+	ASSERT(node_blk);
+
+	dev_read_block(node_blk, ni.blk_addr);
 
 	switch (ntype) {
 	case TYPE_DIRECT_NODE:
-		skip = idx = ADDRS_PER_BLOCK;
+		skip = idx = ADDRS_PER_BLOCK(&node_blk->i);
 		break;
 	case TYPE_INDIRECT_NODE:
 		idx = NIDS_PER_BLOCK;
-		skip = idx * ADDRS_PER_BLOCK;
+		skip = idx * ADDRS_PER_BLOCK(&node_blk->i);
 		break;
 	case TYPE_DOUBLE_INDIRECT_NODE:
 		skip = 0;
@@ -293,11 +280,6 @@ static void dump_node_blk(struct f2fs_sb_info *sbi, int ntype,
 		*ofs += skip;
 		return;
 	}
-
-	get_node_info(sbi, nid, &ni);
-
-	node_blk = calloc(BLOCK_SZ, 1);
-	dev_read_block(node_blk, ni.blk_addr);
 
 	for (i = 0; i < idx; i++, (*ofs)++) {
 		switch (ntype) {
@@ -427,7 +409,7 @@ static void dump_file(struct f2fs_sb_info *sbi, struct node_info *ni,
 				struct f2fs_node *node_blk, int force)
 {
 	struct f2fs_inode *inode = &node_blk->i;
-	u32 imode = le32_to_cpu(inode->i_mode);
+	u32 imode = le16_to_cpu(inode->i_mode);
 	u32 namelen = le32_to_cpu(inode->i_namelen);
 	char name[F2FS_NAME_LEN + 1] = {0};
 	char path[1024] = {0};
@@ -495,6 +477,8 @@ void dump_node(struct f2fs_sb_info *sbi, nid_t nid, int force)
 	get_node_info(sbi, nid, &ni);
 
 	node_blk = calloc(BLOCK_SZ, 1);
+	ASSERT(node_blk);
+
 	dev_read_block(node_blk, ni.blk_addr);
 
 	DBG(1, "Node ID               [0x%x]\n", nid);
@@ -571,7 +555,8 @@ static void dump_data_offset(u32 blk_addr, int ofs_in_node)
 		int dec = (node_ofs - indirect_blks - 3) / (NIDS_PER_BLOCK + 1);
 		bidx = node_ofs - 5 - dec;
 	}
-	bidx = bidx * ADDRS_PER_BLOCK + ADDRS_PER_INODE(&node_blk->i);
+	bidx = bidx * ADDRS_PER_BLOCK(&node_blk->i) +
+				ADDRS_PER_INODE(&node_blk->i);
 got_it:
 	bidx +=  ofs_in_node;
 
@@ -643,8 +628,8 @@ static void dump_dirent(u32 blk_addr, int is_inline, int enc_name)
 
 	while (i < d.max) {
 		struct f2fs_dir_entry *de;
-		unsigned char en[F2FS_NAME_LEN + 1];
-		u16 en_len, name_len;
+		char en[F2FS_PRINT_NAMELEN];
+		u16 name_len;
 		int enc;
 
 		if (!test_bit_le(i, d.bitmap)) {
@@ -670,18 +655,16 @@ static void dump_dirent(u32 blk_addr, int is_inline, int enc_name)
 			}
 		}
 
-		en_len = convert_encrypted_name(d.filename[i],
-				le16_to_cpu(de->name_len), en, enc);
-		en[en_len] = '\0';
+		pretty_print_filename(d.filename[i], name_len, en, enc);
 
 		DBG(1, "bitmap pos[0x%x] name[%s] len[0x%x] hash[0x%x] ino[0x%x] type[0x%x]\n",
 				i, en,
-				le16_to_cpu(de->name_len),
+				name_len,
 				le32_to_cpu(de->hash_code),
 				le32_to_cpu(de->ino),
 				de->file_type);
 
-		i += GET_DENTRY_SLOTS(le16_to_cpu(de->name_len));
+		i += GET_DENTRY_SLOTS(name_len);
 	}
 
 	free(blk);

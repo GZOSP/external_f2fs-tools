@@ -12,6 +12,9 @@
 #ifndef __F2FS_FS_H__
 #define __F2FS_FS_H__
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
@@ -49,6 +52,8 @@
 # define UNUSED(x) UNUSED_ ## x __attribute__((unused))
 #elif defined(__LCLINT__)
 # define UNUSED(x) x
+#elif defined(__cplusplus)
+# define UNUSED(x)
 #else
 # define UNUSED(x) x
 #endif
@@ -275,7 +280,8 @@ static inline uint64_t bswap_64(uint64_t val)
 #define PAGE_CACHE_SIZE		4096
 #define BITS_PER_BYTE		8
 #define F2FS_SUPER_MAGIC	0xF2F52010	/* F2FS Magic Number */
-#define CHECKSUM_OFFSET		4092
+#define CP_CHKSUM_OFFSET	4092
+#define SB_CHKSUM_OFFSET	3068
 #define MAX_PATH_LEN		64
 #define MAX_DEVICES		8
 
@@ -300,6 +306,11 @@ enum f2fs_config_func {
 	DEFRAG,
 	RESIZE,
 	SLOAD,
+};
+
+enum default_set {
+	CONF_NONE = 0,
+	CONF_ANDROID,
 };
 
 struct device_info {
@@ -360,12 +371,18 @@ struct f2fs_configuration {
 	void *private;
 	int dry_run;
 	int fix_on;
+	int force;
+	int defset;
 	int bug_on;
+	int bug_nat_bits;
+	int alloc_failed;
 	int auto_fix;
+	int quota_fix;
 	int preen_mode;
 	int ro;
 	int preserve_limits;		/* preserve quota limits */
 	int large_nat_bitmap;
+	int fix_chksum;			/* fix old cp.chksum position */
 	__le32 feature;			/* defined features */
 
 	/* mkfs parameters */
@@ -375,6 +392,8 @@ struct f2fs_configuration {
 	u_int32_t lpf_inum;
 	u_int32_t lpf_dnum;
 	u_int32_t lpf_ino;
+	u_int32_t root_uid;
+	u_int32_t root_gid;
 
 	/* defragmentation parameters */
 	int defrag_shrink;
@@ -392,6 +411,9 @@ struct f2fs_configuration {
 	struct selinux_opt seopt_file[8];
 	int nr_opt;
 #endif
+
+	/* resize parameters */
+	int safe_resize;
 
 	/* precomputed fs UUID checksum for seeding other checksums */
 	u_int32_t chksum_seed;
@@ -530,6 +552,7 @@ enum {
 
 #define NULL_ADDR		0x0U
 #define NEW_ADDR		-1U
+#define COMPRESS_ADDR		-2U
 
 #define F2FS_ROOT_INO(sbi)	(sbi->root_ino_num)
 #define F2FS_NODE_INO(sbi)	(sbi->node_ino_num)
@@ -565,6 +588,8 @@ enum {
 #define F2FS_FEATURE_INODE_CRTIME	0x0100
 #define F2FS_FEATURE_LOST_FOUND		0x0200
 #define F2FS_FEATURE_VERITY		0x0400	/* reserved */
+#define F2FS_FEATURE_SB_CHKSUM		0x0800
+#define F2FS_FEATURE_COMPRESSION	0x1000
 
 #define MAX_VOLUME_NAME		512
 
@@ -618,12 +643,15 @@ struct f2fs_super_block {
 	struct f2fs_device devs[MAX_DEVICES];	/* device list */
 	__le32 qf_ino[F2FS_MAX_QUOTAS];	/* quota inode numbers */
 	__u8 hot_ext_count;		/* # of hot file extension */
-	__u8 reserved[314];		/* valid reserved region */
+	__u8 reserved[310];		/* valid reserved region */
+	__le32 crc;			/* checksum of superblock */
 } __attribute__((packed));
 
 /*
  * For checkpoint
  */
+#define CP_DISABLED_FLAG		0x00001000
+#define CP_QUOTA_NEED_FSCK_FLAG		0x00000800
 #define CP_LARGE_NAT_BITMAP_FLAG	0x00000400
 #define CP_NOCRC_RECOVERY_FLAG	0x00000200
 #define CP_TRIMMED_FLAG		0x00000100
@@ -667,10 +695,15 @@ struct f2fs_checkpoint {
 	unsigned char sit_nat_version_bitmap[1];
 } __attribute__((packed));
 
+#define CP_BITMAP_OFFSET	\
+	(offsetof(struct f2fs_checkpoint, sit_nat_version_bitmap))
+#define CP_MIN_CHKSUM_OFFSET	CP_BITMAP_OFFSET
+
+#define MIN_NAT_BITMAP_SIZE	64
 #define MAX_SIT_BITMAP_SIZE_IN_CKPT    \
-	(CHECKSUM_OFFSET - sizeof(struct f2fs_checkpoint) + 1 - 64)
+	(CP_CHKSUM_OFFSET - CP_BITMAP_OFFSET - MIN_NAT_BITMAP_SIZE)
 #define MAX_BITMAP_SIZE_IN_CKPT	\
-	(CHECKSUM_OFFSET - sizeof(struct f2fs_checkpoint) + 1)
+	(CP_CHKSUM_OFFSET - CP_BITMAP_OFFSET)
 
 /*
  * For orphan inode management
@@ -696,13 +729,18 @@ struct f2fs_extent {
 } __attribute__((packed));
 
 #define F2FS_NAME_LEN		255
+
+/* max output length of pretty_print_filename() including null terminator */
+#define F2FS_PRINT_NAMELEN	(4 * ((F2FS_NAME_LEN + 2) / 3) + 1)
+
 /* 200 bytes for inline xattrs by default */
 #define DEFAULT_INLINE_XATTR_ADDRS	50
 #define DEF_ADDRS_PER_INODE	923	/* Address Pointers in an Inode */
 #define CUR_ADDRS_PER_INODE(inode)	(DEF_ADDRS_PER_INODE - \
 					__get_extra_isize(inode))
 #define ADDRS_PER_INODE(i)	addrs_per_inode(i)
-#define ADDRS_PER_BLOCK         1018	/* Address Pointers in a Direct Block */
+#define DEF_ADDRS_PER_BLOCK	1018	/* Address Pointers in a Direct Block */
+#define ADDRS_PER_BLOCK(i)	addrs_per_block(i)
 #define NIDS_PER_BLOCK          1018	/* Node IDs in an Indirect Block */
 
 #define	NODE_DIR1_BLOCK		(DEF_ADDRS_PER_INODE + 1)
@@ -722,9 +760,10 @@ struct f2fs_extent {
 #define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
 #endif
 
+#define F2FS_EXTRA_ISIZE_OFFSET				\
+	offsetof(struct f2fs_inode, i_extra_isize)
 #define F2FS_TOTAL_EXTRA_ATTR_SIZE			\
-	(offsetof(struct f2fs_inode, i_extra_end) -	\
-	offsetof(struct f2fs_inode, i_extra_isize))	\
+	(offsetof(struct f2fs_inode, i_extra_end) - F2FS_EXTRA_ISIZE_OFFSET)
 
 #define	F2FS_DEF_PROJID		0	/* default project ID */
 
@@ -758,6 +797,10 @@ struct f2fs_extent {
 #define file_is_encrypt(fi)      ((fi)->i_advise & FADVISE_ENCRYPT_BIT)
 #define file_enc_name(fi)        ((fi)->i_advise & FADVISE_ENC_NAME_BIT)
 
+/*
+ * inode flags
+ */
+#define F2FS_COMPR_FL		0x00000004 /* Compress file */
 struct f2fs_inode {
 	__le16 i_mode;			/* file mode */
 	__u8 i_advise;			/* file hints */
@@ -774,7 +817,13 @@ struct f2fs_inode {
 	__le32 i_ctime_nsec;		/* change time in nano scale */
 	__le32 i_mtime_nsec;		/* modification time in nano scale */
 	__le32 i_generation;		/* file version (for NFS) */
-	__le32 i_current_depth;		/* only for directory depth */
+	union {
+		__le32 i_current_depth;	/* only for directory depth */
+		__le16 i_gc_failures;	/*
+					 * # of gc failures on pinned file.
+					 * only for regular files.
+					 */
+	};
 	__le32 i_xattr_nid;		/* nid to save xattr */
 	__le32 i_flags;			/* file attributes */
 	__le32 i_pino;			/* parent inode number */
@@ -792,6 +841,9 @@ struct f2fs_inode {
 			__le32 i_inode_checksum;/* inode meta checksum */
 			__le64 i_crtime;	/* creation time */
 			__le32 i_crtime_nsec;	/* creation time in nano scale */
+			__u8 i_compress_algrithm;	/* compress algrithm */
+			__u8 i_log_cluster_size;	/* log of cluster size */
+			__le16 i_padding;		/* padding */
 			__le32 i_extra_end[0];	/* for attribute size calculation */
 		} __attribute__((packed));
 		__le32 i_addr[DEF_ADDRS_PER_INODE];	/* Pointers to data blocks */
@@ -802,7 +854,7 @@ struct f2fs_inode {
 
 
 struct direct_node {
-	__le32 addr[ADDRS_PER_BLOCK];	/* array of data block address */
+	__le32 addr[DEF_ADDRS_PER_BLOCK];	/* array of data block address */
 } __attribute__((packed));
 
 struct indirect_node {
@@ -868,6 +920,7 @@ struct f2fs_nat_block {
  * F2FS uses 4 bytes to represent block address. As a result, supported size of
  * disk is 16 TB and it equals to 16 * 1024 * 1024 / 2 segments.
  */
+#define F2FS_MIN_SEGMENT      9 /* SB + 2 (CP + SIT + NAT) + SSA + MAIN */
 #define F2FS_MAX_SEGMENT       ((16 * 1024 * 1024) / 2)
 #define MAX_SIT_BITMAP_SIZE    (SEG_ALIGN(SIZE_ALIGN(F2FS_MAX_SEGMENT, \
 						SIT_ENTRY_PER_BLOCK)) * \
@@ -1039,6 +1092,7 @@ typedef __le32	f2fs_hash_t;
 #define SIZE_OF_RESERVED	(PAGE_SIZE - ((SIZE_OF_DIR_ENTRY + \
 				F2FS_SLOT_LEN) * \
 				NR_DENTRY_IN_BLOCK + SIZE_OF_DENTRY_BITMAP))
+#define MIN_INLINE_DENTRY_SIZE		40	/* just include '.' and '..' entries */
 
 /* One directory entry slot representing F2FS_SLOT_LEN-sized file name */
 struct f2fs_dir_entry {
@@ -1099,7 +1153,10 @@ extern int utf8_to_utf16(u_int16_t *, const char *, size_t, size_t);
 extern int utf16_to_utf8(char *, const u_int16_t *, size_t, size_t);
 extern int log_base_2(u_int32_t);
 extern unsigned int addrs_per_inode(struct f2fs_inode *);
+extern unsigned int addrs_per_block(struct f2fs_inode *);
 extern __u32 f2fs_inode_chksum(struct f2fs_node *);
+extern __u32 f2fs_checkpoint_chksum(struct f2fs_checkpoint *);
+extern int write_inode(struct f2fs_node *, u64);
 
 extern int get_bits_in_byte(unsigned char n);
 extern int test_and_set_bit_le(u32, u8 *);
@@ -1116,8 +1173,10 @@ extern int f2fs_crc_valid(u_int32_t blk_crc, void *buf, int len);
 
 extern void f2fs_init_configuration(void);
 extern int f2fs_devs_are_umounted(void);
+extern int f2fs_dev_is_writable(void);
 extern int f2fs_dev_is_umounted(char *);
 extern int f2fs_get_device_info(void);
+extern unsigned int calc_extra_isize(void);
 extern int get_device_info(int);
 extern int f2fs_init_sparse_file(void);
 extern int f2fs_finalize_device(void);
@@ -1227,12 +1286,10 @@ blk_zone_cond_str(struct blk_zone *blkz)
 
 #endif
 
-extern void f2fs_get_zoned_model(int);
+extern int f2fs_get_zoned_model(int);
 extern int f2fs_get_zone_blocks(int);
 extern int f2fs_check_zones(int);
 extern int f2fs_reset_zones(int);
-
-extern struct f2fs_configuration c;
 
 #define SIZE_ALIGN(val, size)	((val) + (size) - 1) / (size)
 #define SEG_ALIGN(blks)		SIZE_ALIGN(blks, c.blks_per_seg)
@@ -1295,6 +1352,106 @@ static inline int is_qf_ino(struct f2fs_super_block *sb, nid_t ino)
 	for (i = 0; i < F2FS_MAX_QUOTAS; i++)
 		if (sb->qf_ino[i] == ino)
 			return 1;
+	return 0;
+}
+
+static inline void show_version(const char *prog)
+{
+#if defined(F2FS_TOOLS_VERSION) && defined(F2FS_TOOLS_DATE)
+	MSG(0, "%s %s (%s)\n", prog, F2FS_TOOLS_VERSION, F2FS_TOOLS_DATE);
+#else
+	MSG(0, "%s -- version not supported\n", prog);
+#endif
+}
+
+struct feature {
+	char *name;
+	u32  mask;
+};
+
+#define INIT_FEATURE_TABLE						\
+struct feature feature_table[] = {					\
+	{ "encrypt",			F2FS_FEATURE_ENCRYPT },		\
+	{ "extra_attr",			F2FS_FEATURE_EXTRA_ATTR },	\
+	{ "project_quota",		F2FS_FEATURE_PRJQUOTA },	\
+	{ "inode_checksum",		F2FS_FEATURE_INODE_CHKSUM },	\
+	{ "flexible_inline_xattr",	F2FS_FEATURE_FLEXIBLE_INLINE_XATTR },\
+	{ "quota",			F2FS_FEATURE_QUOTA_INO },	\
+	{ "inode_crtime",		F2FS_FEATURE_INODE_CRTIME },	\
+	{ "lost_found",			F2FS_FEATURE_LOST_FOUND },	\
+	{ "verity",			F2FS_FEATURE_VERITY },	/* reserved */ \
+	{ "sb_checksum",		F2FS_FEATURE_SB_CHKSUM },	\
+	{ "compression",		F2FS_FEATURE_COMPRESSION },	\
+	{ NULL,				0x0},				\
+};
+
+static inline u32 feature_map(struct feature *table, char *feature)
+{
+	struct feature *p;
+	for (p = table; p->name && strcmp(p->name, feature); p++)
+		;
+	return p->mask;
+}
+
+static inline int set_feature_bits(struct feature *table, char *features)
+{
+	u32 mask = feature_map(table, features);
+	if (mask) {
+		c.feature |= cpu_to_le32(mask);
+	} else {
+		MSG(0, "Error: Wrong features %s\n", features);
+		return -1;
+	}
+	return 0;
+}
+
+static inline int parse_feature(struct feature *table, const char *features)
+{
+	char *buf, *sub, *next;
+
+	buf = strdup(features);
+	if (!buf)
+		return -1;
+
+	for (sub = buf; sub && *sub; sub = next ? next + 1 : NULL) {
+		/* Skip the beginning blanks */
+		while (*sub && *sub == ' ')
+			sub++;
+		next = sub;
+		/* Skip a feature word */
+		while (*next && *next != ' ' && *next != ',')
+			next++;
+
+		if (*next == 0)
+			next = NULL;
+		else
+			*next = 0;
+
+		if (set_feature_bits(table, sub)) {
+			free(buf);
+			return -1;
+		}
+	}
+	free(buf);
+	return 0;
+}
+
+static inline int parse_root_owner(char *ids,
+			u_int32_t *root_uid, u_int32_t *root_gid)
+{
+	char *uid = ids;
+	char *gid = NULL;
+	int i;
+
+	/* uid:gid */
+	for (i = 0; i < strlen(ids) - 1; i++)
+		if (*(ids + i) == ':')
+			gid = ids + i + 1;
+	if (!gid)
+		return -1;
+
+	*root_uid = atoi(uid);
+	*root_gid = atoi(gid);
 	return 0;
 }
 
